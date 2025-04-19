@@ -1,3 +1,5 @@
+import os from 'os';
+import { Worker, isMainThread, parentPort, workerData } from 'worker_threads';
 import { sha256 } from '@noble/hashes/sha256'
 import { sha512 } from '@noble/hashes/sha512';
 import { pbkdf2 } from '@noble/hashes/pbkdf2';
@@ -7,8 +9,12 @@ import { mod } from '@noble/curves/abstract/modular';
 import { keccak_256 } from '@noble/hashes/sha3';
 import { wordlist } from '@scure/bip39/wordlists/english';
 
-// Encoders/Decoders
 const encoder = new TextEncoder()
+const uint32Buffer = new Uint8Array(4);
+const uint32View = new DataView(uint32Buffer.buffer);
+const zeroBuffer = new Uint8Array([0])
+
+// Encoders/Decoders
 function bytesToNumber(bytes: Uint8Array): bigint {
   let value = 0n;
   for (let i = 0; i < bytes.length; i++) {
@@ -34,9 +40,6 @@ function hexToBytes(hex: string): Uint8Array {
 
   return bytes;
 }
-const uint32Buffer = new Uint8Array(4);
-const uint32View = new DataView(uint32Buffer.buffer);
-const zeroBuffer = new Uint8Array([0])
 
 function toU32(n: number) {
   uint32View.setUint32(0, n, false);
@@ -70,7 +73,7 @@ const mnemonicToSeed = (mnemonic: string) => pbkdf2(sha512, mnemonic, 'mnemonic'
 function seedToPrivKey(seed: Uint8Array) {
   let I = hmac(sha512, bitcoinSeed, seed);
   let privateKey = bytesToNumber(I.slice(0, 32))
-  for (const c of [ "44'", "0'", "0'", "0", "0" ]) {
+  for (const c of [ "44'", "60'", "0'", "0", "0" ]) {
     const hardened = c.endsWith("'");
     const index = parseInt(c.replace("'", "")) + (hardened ? 0x80000000 : 0);
     
@@ -81,7 +84,6 @@ function seedToPrivKey(seed: Uint8Array) {
   }
   return privateKey.toString(16).padStart(64, '0');
 }
-
 const privateKeyToPublicKey = (privateKey: string) => bytesToHex(secp256k1.getPublicKey(privateKey, false)).substring(2)
 const publicKeyToAddress = (publicKey: string) => bytesToHex(keccak_256(hexToBytes(publicKey))).substring(24).toLowerCase()
 const mnemonicToAddress = (mnemonic: string) => publicKeyToAddress(privateKeyToPublicKey(seedToPrivKey(mnemonicToSeed(mnemonic))))
@@ -108,30 +110,52 @@ function generateMnemonic() {
   return res.map((i) => wordlist[i]!).join(' ');
 }
 
-const bestAddress: { phrase: string, zeroBytes: number } = { phrase: '', zeroBytes: 0 }
+const bestAddress: { phrase: string, zeroBytes: number, timeToFind: number } = { phrase: '', zeroBytes: 0, timeToFind: 0 }
 const startTime = +new Date()
 
-while (true) {
-  const phrase = generateMnemonic()
-  const address = mnemonicToAddress(phrase);
+const sharedBuffer = new SharedArrayBuffer(4);
+const sharedArray = new Int32Array(sharedBuffer);
+Atomics.store(sharedArray, 0, 0);
+sharedArray[0] = 0;
 
-  let zeroBytes = 0;
-  for (let i = 0; i < 40; i += 2) {
-    if (address.substring(i, i+2) === '00') zeroBytes++
+if (isMainThread) {
+   for (let workerId = 0; workerId < os.cpus().length; workerId++) {
+    const worker = new Worker(__filename, { workerData: { workerId, sharedBuffer }});
+    
+    worker.on('message', (result: { phrase: string, address: string, zeroBytes: number, workerId: number }) => {
+      const { phrase, address, zeroBytes, workerId } = result;
+
+      if (zeroBytes >= bestAddress.zeroBytes) {
+        bestAddress.phrase = phrase;
+
+        if (zeroBytes > bestAddress.zeroBytes) {
+          bestAddress.zeroBytes = zeroBytes;
+          bestAddress.timeToFind = +new Date() - startTime;
+          Atomics.store(sharedArray, 0, zeroBytes);
+        }
+
+        console.log('----');
+        console.log('Zero Bytes:', zeroBytes);
+        console.log('Worker:', workerId);
+        console.log('Mins Till Next Address:', Math.round(bestAddress.timeToFind/6000 * 256)/10);
+        console.log('Address:', `0x${address}`);
+        console.log('Seed Phrase:', phrase);
+        console.log('----\n');
+      }
+    });
   }
+} else doWork(workerData.workerId, new Int32Array(workerData.sharedBuffer));
 
-  if (zeroBytes >= bestAddress.zeroBytes) {
-    bestAddress.phrase = phrase;
-    bestAddress.zeroBytes = zeroBytes;
+function doWork(workerId: number, sharedBestZeroBytes: Int32Array) {
+  while (true) {
+    const phrase = generateMnemonic();
+    const address = mnemonicToAddress(phrase);
+    
+    let zeroBytes = 0;
+    for (let i = 0; i < 40; i += 2) {
+      if (address.substring(i, i+2) === '00') zeroBytes++;
+    }
 
-    const runTime = +new Date() - startTime
-
-    console.log('----')
-    console.log('Run Seconds:', Math.round(runTime/1000))
-    console.log('Zero Bytes:', zeroBytes)
-    console.log('Mins Till Next Address:', Math.round((Math.pow(256, zeroBytes))/(Math.pow(256, zeroBytes-1)/runTime)/60000))
-    console.log('Address:', `0x${address}`);
-    console.log('Seed Phrase:', phrase)
-    console.log('----\n')
+    if (zeroBytes >= Atomics.load(sharedBestZeroBytes, 0)) parentPort?.postMessage({ phrase, address, zeroBytes, workerId });
   }
 }
